@@ -1,0 +1,426 @@
+---
+title: "Dissolved Oxygen Units Comparison - Summary (without flags)"
+author: "LB"
+date: "2024-08-19"
+execute: 
+  echo: false
+format: html
+editor: visual
+---
+
+```{r}
+#| warning: false
+library(docalcs)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(here)
+library(lubridate)
+library(qaqcmar)
+library(sensorstrings)
+
+dat_raw <- ss_import_data(county = c("Halifax", "Lunenburg"))
+
+# Set bin width for setting equal timestamps (same for all deployments)
+minutes <- minutes(7)
+seconds <- seconds(30)
+
+# Set salinity value for DO conversions
+salinity = 35
+
+```
+
+This document summarizes DO unit comparison work. The goal of this analysis is to determine how well CMAR's current method for converting DO mg/L to % saturation performs. 4 stations with DO sensors observing different units were examined. The conversion is applied to mg/L observations and the resulting values are compared with the observed % sat values from the other sensor.
+
+Notes: 
+
+- This document removes all observations not flagged as Pass (1). To see this analysis with all observations regardless of QC flag, see do_units_summary_with_flags. 
+
+- Flat Island, 2022-11-19 was removed from this analysis as the entire deployment failed QC testing.
+
+## Birchy Head, 2022-11-03
+
+### Raw Observations
+
+The conversion is applied to the Hobo DO observations and both sets of observations are plotted alongside eachother to roughly assess performance.
+
+```{r}
+depl_bh <- dat_raw %>%
+  filter(station == "Birchy Head" & 
+           deployment_range == "2022-Nov-03 to 2023-May-15" & 
+           sensor_depth_at_low_tide_m == 5 &
+           (qc_flag_dissolved_oxygen_percent_saturation == 1 | qc_flag_dissolved_oxygen_uncorrected_mg_per_l == 1)) #Filter down to observations with a flag of 1
+
+# Separate two DO units (and apply conversion to mg/L)
+depl_bh_dat_sat <- depl_bh %>%
+  select(-salinity_psu) %>%
+  filter(!is.na(dissolved_oxygen_percent_saturation))
+
+depl_bh_dat_mgl <- depl_bh %>%
+  select(-salinity_psu) %>%
+  filter(!is.na(dissolved_oxygen_uncorrected_mg_per_l)) %>%
+  do_salinity_correction(sal = salinity) %>%
+  do_solubility(p_atm = 1, return_factors = TRUE) %>%
+  mutate(
+    dissolved_oxygen_mg_per_l = F_s * dissolved_oxygen_uncorrected_mg_per_l,
+    dissolved_oxygen_percent_saturation = 100 * dissolved_oxygen_mg_per_l / C_p
+  ) %>%
+  select(
+    sensor_type:F_s, temperature, C_p,
+    dissolved_oxygen_mg_per_l, dissolved_oxygen_percent_saturation
+  )
+
+bh_mgl <- depl_bh_dat_mgl %>%
+  select("sensor_type", "timestamp_utc", "dissolved_oxygen_percent_saturation", "dissolved_oxygen_uncorrected_mg_per_l")
+
+bh_sat <- depl_bh_dat_sat %>%
+  select("sensor_type", "timestamp_utc", "dissolved_oxygen_percent_saturation", "dissolved_oxygen_uncorrected_mg_per_l")
+
+new_bh_dat <- rbind(bh_mgl, bh_sat) %>%
+  arrange(timestamp_utc)
+
+#Note how lines diverge only when biofouling starts (according to qc report all observations from just before April on are suspect)
+colors <- c("aquameasure" = "#26A1D0", "hobo" = "#023C4C")
+
+bh <- ggplot(new_bh_dat, aes(x=timestamp_utc, y=dissolved_oxygen_percent_saturation)) +
+  geom_line(aes(color = sensor_type)) +
+  ggtitle("Observed and Converted Percent Saturation", subtitle = "Birchy Head, 2022-11-03") +
+  xlab("Observation Timestamp") +
+  ylab("DO % saturation") +
+  labs(color = "Sensor Type", caption = "Note: Hobo observations are converted from mg/L") +
+  scale_color_manual(values = colors)
+
+bh
+
+```
+
+### Cleaned Observations
+
+To perform a direct comparison, both sets of observations must have the same number of observations. Since the sensors observe at different intervals (Hobo ~ 15 mins, Aquameasure ~ 10 mins), the timestamps of one must be converted to match the other. 
+
+This was done by averaging all Aquameasure observations 7.5 mins before and after the timestamp of each Hobo observation. and setting the new timestamp as such. We repeat the plot from above with these new observations.
+
+```{r}
+bh_both_dat <- data.frame(bh_mgl, dissolved_oxygen_percent_saturation_avg = rep(NA, length(bh_mgl$timestamp_utc))) %>%
+  rename(dissolved_oxygen_percent_saturation_converted = dissolved_oxygen_percent_saturation)
+
+# Loop through new dataframe to enter average value in the required column
+for(i in 1:length(bh_both_dat$timestamp_utc)){
+  curr_time <- bh_both_dat$timestamp_utc[i]
+  curr_time_lb <- curr_time - minutes - seconds
+  curr_time_ub <- curr_time + minutes + seconds
+  
+  temp_dat <- bh_sat %>%
+    filter(timestamp_utc >= curr_time_lb & timestamp_utc < curr_time_ub)
+  
+  bh_both_dat$dissolved_oxygen_percent_saturation_avg[i] <- mean(temp_dat$dissolved_oxygen_percent_saturation)
+}
+
+# To plot, we must remove missing values in the average column (When we remove the flag >1 observations are removed from bh_mgl, so we can only plot timestamps that have observations of both the observed and average)
+bh_both_dat <- bh_both_dat %>%
+  filter(!is.na(dissolved_oxygen_percent_saturation_avg)) %>%
+  mutate(abs_difference = abs(dissolved_oxygen_percent_saturation_avg - dissolved_oxygen_percent_saturation_converted))
+
+# Plot both lines together
+colors <- c("Converted" = "#023C4C", "Observed" = "#26A1D0")
+
+bh_2 <- ggplot(bh_both_dat, aes(timestamp_utc)) +
+  geom_line(aes(y=dissolved_oxygen_percent_saturation_converted, color="Converted")) +
+  geom_line(aes(y=dissolved_oxygen_percent_saturation_avg, color="Observed")) +
+  ggtitle("Observed and Converted Percent Saturation", subtitle = "Birchy Head, 2022-11-03") +
+  labs(x = "Observation Timestamp", y = "DO % saturation", color = "Legend") +
+  scale_color_manual(values = colors)
+
+bh_2
+```
+
+### Direct Comparison
+
+Now that we have the same number of observations for each sensor, we can plot converted values vs. observed values. Here, we are looking for linearity (i.e. higher linearity implies a better performing conversion).
+
+The solid line on the plot below is the 1:1 line, and the dashed lines represent the +/- 5% expected accuracy of our DO sensors.
+
+```{r}
+ggplot(bh_both_dat, aes(x = dissolved_oxygen_percent_saturation_avg, y = dissolved_oxygen_percent_saturation_converted, color = timestamp_utc)) +
+  geom_point(alpha=0.5) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_abline(slope = 1, intercept = 5, linetype = 'dashed') +
+  geom_abline(slope = 1, intercept = -5, linetype = 'dashed') +
+  ggtitle("Dissolved Oxygen Converted units versus Observed units", subtitle = "Birchy Head, 2022-11-03") +
+  xlab("Observed") +
+  ylab("Converted") +
+  labs(color = "Observation Date") +
+  theme_light()
+```
+
+Finally, we see the R^2 value for the above data. (Recall R^2 ~ 1 implies a stronger fit, or better performing conversion)
+
+```{r}
+x = cor(x = bh_both_dat$dissolved_oxygen_percent_saturation_avg, y = bh_both_dat$dissolved_oxygen_percent_saturation_converted)
+x^2
+```
+
+## Little Rafuse Island, 2021-11-21
+
+### Raw Observations
+
+The conversion is applied to the Hobo DO observations and both sets of observations are plotted alongside eachother to roughly assess performance.
+
+```{r}
+depl_lri <- dat_raw %>%
+  filter(station == "Little Rafuse Island" & 
+           deployment_range == "2021-Nov-21 to 2022-May-24" & 
+           sensor_depth_at_low_tide_m == 5 &
+           (qc_flag_dissolved_oxygen_percent_saturation == 1 | qc_flag_dissolved_oxygen_uncorrected_mg_per_l == 1)) #Filter down to observations with a flag of 1
+
+# Separate two DO units (and apply conversion to mg/L)
+depl_lri_dat_sat <- depl_lri %>%
+  select(-salinity_psu) %>%
+  filter(!is.na(dissolved_oxygen_percent_saturation))
+
+
+depl_lri_dat_mgl <- depl_lri %>%
+  select(-salinity_psu) %>%
+  filter(!is.na(dissolved_oxygen_uncorrected_mg_per_l)) %>%
+  do_salinity_correction(sal = salinity) %>%
+  do_solubility(p_atm = 1, return_factors = TRUE) %>%
+  mutate(
+    dissolved_oxygen_mg_per_l = F_s * dissolved_oxygen_uncorrected_mg_per_l,
+    dissolved_oxygen_percent_saturation = 100 * dissolved_oxygen_mg_per_l / C_p
+  ) %>%
+  select(
+    sensor_type:F_s, temperature, C_p,
+    dissolved_oxygen_mg_per_l, dissolved_oxygen_percent_saturation
+  )
+
+lri_mgl <- depl_lri_dat_mgl %>%
+  select("sensor_type", "timestamp_utc", "dissolved_oxygen_percent_saturation", "dissolved_oxygen_uncorrected_mg_per_l")
+
+lri_sat <- depl_lri_dat_sat %>%
+  select("sensor_type", "timestamp_utc", "dissolved_oxygen_percent_saturation", "dissolved_oxygen_uncorrected_mg_per_l")
+
+new_lri_dat <- rbind(lri_mgl, lri_sat) %>%
+  arrange(timestamp_utc)
+
+colors <- c("aquameasure" = "#26A1D0", "hobo" = "#023C4C")
+
+lri <- ggplot(new_lri_dat, aes(x=timestamp_utc, y=dissolved_oxygen_percent_saturation)) +
+  geom_line(aes(color = sensor_type)) +
+  ggtitle("Observed and Converted Percent Saturation", 
+          subtitle = "Little Rafuse Island, 2021-11-21") +
+  xlab("Observation Timestamp") +
+  ylab("DO % saturation") +
+  labs(color = "Sensor Type", caption = "Note: Hobo observations are converted from mg/L") +
+  scale_color_manual(values = colors)
+
+lri
+
+```
+
+### Cleaned Observations
+
+To perform a direct comparison, both sets of observations must have the same number of observations. Since the sensors observe at different intervals (Hobo ~ 15 mins, Aquameasure ~ 10 mins), the timestamps of one must be converted to match the other. 
+
+This was done by averaging all Aquameasure observations 7.5 mins before and after the timestamp of each Hobo observation. and setting the new timestamp as such. We repeat the plot from above with these new observations.
+
+```{r}
+lri_both_dat <- data.frame(lri_mgl, dissolved_oxygen_percent_saturation_avg = rep(NA, length(lri_mgl$timestamp_utc))) %>%
+  rename(dissolved_oxygen_percent_saturation_converted = dissolved_oxygen_percent_saturation)
+
+# Loop through new dataframe to enter average value in the required column
+for(i in 1:length(lri_both_dat$timestamp_utc)){
+  curr_time <- lri_both_dat$timestamp_utc[i]
+  curr_time_lb <- curr_time - minutes - seconds
+  curr_time_ub <- curr_time + minutes + seconds
+  
+  temp_dat <- lri_sat %>%
+    filter(timestamp_utc >= curr_time_lb & timestamp_utc < curr_time_ub)
+  
+  lri_both_dat$dissolved_oxygen_percent_saturation_avg[i] <- mean(temp_dat$dissolved_oxygen_percent_saturation)
+}
+
+lri_both_dat <- lri_both_dat %>%
+  filter(!is.na(dissolved_oxygen_percent_saturation_avg)) %>%
+  mutate(abs_difference = abs(dissolved_oxygen_percent_saturation_avg - dissolved_oxygen_percent_saturation_converted))
+
+# Plot both lines together
+colors <- c("Converted" = "#023C4C", "Observed" = "#26A1D0")
+
+lri_2 <- ggplot(lri_both_dat, aes(timestamp_utc)) +
+  geom_line(aes(y=dissolved_oxygen_percent_saturation_converted, color="Converted")) +
+  geom_line(aes(y=dissolved_oxygen_percent_saturation_avg, color="Observed")) +
+  ggtitle("Observed and Converted Percent Saturation", 
+          subtitle = "Little Rafuse Island, 2021-11-21") +
+  labs(x = "Observation Timestamp", y = "DO % saturation", color = "Legend") +
+  scale_color_manual(values = colors)
+
+lri_2
+```
+
+### Direct Comparison
+
+Now that we have the same number of observations for each sensor, we can plot converted values vs. observed values. Here, we are looking for linearity (i.e. higher linearity implies a better performing conversion).
+
+The solid line on the plot below is the 1:1 line, and the dashed lines represent the +/- 5% expected accuracy of our DO sensors.
+
+```{r}
+ggplot(lri_both_dat, aes(x = dissolved_oxygen_percent_saturation_avg, y = dissolved_oxygen_percent_saturation_converted, color = timestamp_utc)) +
+  geom_point(alpha=0.5) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_abline(slope = 1, intercept = 5, linetype = 'dashed') +
+  geom_abline(slope = 1, intercept = -5, linetype = 'dashed') +
+  ggtitle("Dissolved Oxygen Converted units versus Observed units", 
+          subtitle = "Little Rafuse Island, 2021-11-21") +
+  xlab("Observed") +
+  ylab("Converted") +
+  labs(color = "Observation Date") +
+  theme_light()
+```
+
+Finally, we see the R^2 value for the above data. (Recall R^2 ~ 1 implies a stronger fit, or better performing conversion)
+
+```{r}
+x = cor(x = lri_both_dat$dissolved_oxygen_percent_saturation_avg, 
+        y = lri_both_dat$dissolved_oxygen_percent_saturation_converted)
+x^2
+```
+
+## Little Rafuse Island, 2022-11-19
+
+### Raw Observations
+
+The conversion is applied to the Hobo DO observations and both sets of observations are plotted alongside eachother to roughly assess performance.
+
+```{r}
+depl_lri_2 <- dat_raw %>%
+  filter(station == "Little Rafuse Island" & 
+           deployment_range == "2022-Nov-19 to 2023-May-09" & 
+           sensor_depth_at_low_tide_m == 5 &
+           (qc_flag_dissolved_oxygen_percent_saturation == 1 | qc_flag_dissolved_oxygen_uncorrected_mg_per_l == 1))
+
+# Separate two DO units (and apply conversion to mg/L)
+depl_lri_2_dat_sat <- depl_lri_2 %>%
+  select(-salinity_psu) %>%
+  filter(!is.na(dissolved_oxygen_percent_saturation))
+
+
+depl_lri_2_dat_mgl <- depl_lri_2 %>%
+  select(-salinity_psu) %>%
+  filter(!is.na(dissolved_oxygen_uncorrected_mg_per_l)) %>%
+  do_salinity_correction(sal = salinity) %>%
+  do_solubility(p_atm = 1, return_factors = TRUE) %>%
+  mutate(
+    dissolved_oxygen_mg_per_l = F_s * dissolved_oxygen_uncorrected_mg_per_l,
+    dissolved_oxygen_percent_saturation = 100 * dissolved_oxygen_mg_per_l / C_p
+  ) %>%
+  select(
+    sensor_type:F_s, temperature, C_p,
+    dissolved_oxygen_mg_per_l, dissolved_oxygen_percent_saturation
+  )
+
+lri_2_mgl <- depl_lri_2_dat_mgl %>%
+  select("sensor_type", "timestamp_utc", "dissolved_oxygen_percent_saturation", "dissolved_oxygen_uncorrected_mg_per_l")
+
+lri_2_sat <- depl_lri_2_dat_sat %>%
+  select("sensor_type", "timestamp_utc", "dissolved_oxygen_percent_saturation", "dissolved_oxygen_uncorrected_mg_per_l")
+
+new_lri_2_dat <- rbind(lri_2_mgl, lri_2_sat) %>%
+  arrange(timestamp_utc)
+
+colors <- c("aquameasure" = "#26A1D0", "hobo" = "#023C4C")
+
+lri_2 <- ggplot(new_lri_2_dat, aes(x=timestamp_utc, y=dissolved_oxygen_percent_saturation)) +
+  geom_line(aes(color = sensor_type)) +
+  ggtitle("Observed and Converted Percent Saturation", 
+          subtitle = "Little Rafuse Island, 2022-11-19") +
+  xlab("Observation Timestamp") +
+  ylab("DO % saturation") +
+  labs(color = "Sensor Type", caption = "Note: Hobo observations are converted from mg/L") +
+  scale_color_manual(values = colors)
+
+lri_2
+
+```
+
+### Cleaned Observations
+
+To perform a direct comparison, both sets of observations must have the same number of observations. Since the sensors observe at different intervals (Hobo ~ 15 mins, Aquameasure ~ 10 mins), the timestamps of one must be converted to match the other. 
+
+This was done by averaging all Aquameasure observations 7.5 mins before and after the timestamp of each Hobo observation. and setting the new timestamp as such. We repeat the plot from above with these new observations.
+
+```{r}
+lri_2_both_dat <- data.frame(lri_2_mgl, dissolved_oxygen_percent_saturation_avg = rep(NA, length(lri_2_mgl$timestamp_utc))) %>%
+  rename(dissolved_oxygen_percent_saturation_converted = dissolved_oxygen_percent_saturation)
+
+# Loop through new dataframe to enter average value in the required column
+for(i in 1:length(lri_2_both_dat$timestamp_utc)){
+  curr_time <- lri_2_both_dat$timestamp_utc[i]
+  curr_time_lb <- curr_time - minutes - seconds
+  curr_time_ub <- curr_time + minutes + seconds
+  
+  temp_dat <- lri_2_sat %>%
+    filter(timestamp_utc >= curr_time_lb & timestamp_utc < curr_time_ub)
+  
+  #sat_avg = mean(temp_dat$dissolved_oxygen_percent_saturation)
+  
+  lri_2_both_dat$dissolved_oxygen_percent_saturation_avg[i] <- mean(temp_dat$dissolved_oxygen_percent_saturation)
+}
+
+lri_2_both_dat <- lri_2_both_dat %>%
+  filter(!is.na(dissolved_oxygen_percent_saturation_avg)) %>%
+  mutate(abs_difference = abs(dissolved_oxygen_percent_saturation_avg - dissolved_oxygen_percent_saturation_converted))
+
+# Plot both lines together
+colors <- c("Converted" = "#023C4C", "Observed" = "#26A1D0")
+
+#lri_2 <- ggplot(lri_both_dat, aes(timestamp_utc)) +
+ # geom_line(aes(y=dissolved_oxygen_percent_saturation_converted, color="Converted")) +
+#  geom_line(aes(y=dissolved_oxygen_percent_saturation_avg, color="Observed")) +
+ # ggtitle("Observed and Converted Percent Saturation", 
+  #        subtitle = "Little Rafuse Island, 2021-11-21") +
+  #labs(x = "Observation Timestamp", y = "DO % saturation", color = "Legend") +
+  #scale_color_manual(values = colors)
+
+#lri_2
+
+lri_2_2 <- ggplot(lri_2_both_dat, aes(timestamp_utc)) +
+  geom_line(aes(y=dissolved_oxygen_percent_saturation_converted, color="Converted")) +
+  geom_line(aes(y=dissolved_oxygen_percent_saturation_avg, color="Observed")) +
+  ggtitle("Observed and Converted Percent Saturation", 
+          subtitle = "Little Rafuse Island, 2022-11-19") +
+  labs(x = "Observation Timestamp", y = "DO % saturation", color = "Legend") +
+  scale_color_manual(values = colors)
+
+lri_2_2
+```
+
+### Direct Comparison
+
+Now that we have the same number of observations for each sensor, we can plot converted values vs. observed values. Here, we are looking for linearity (i.e. higher linearity implies a better performing conversion).
+
+The solid line on the plot below is the 1:1 line, and the dashed lines represent the +/- 5% expected accuracy of our DO sensors.
+
+```{r}
+ggplot(lri_2_both_dat, aes(x = dissolved_oxygen_percent_saturation_avg, y = dissolved_oxygen_percent_saturation_converted, color = timestamp_utc)) +
+  geom_point(alpha=0.5) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_abline(slope = 1, intercept = 5, linetype = 'dashed') +
+  geom_abline(slope = 1, intercept = -5, linetype = 'dashed') +
+  ggtitle("Dissolved Oxygen Converted units versus Observed units", 
+          subtitle = "Little Rafuse Island, 2022-11-19") +
+  xlab("Observed") +
+  ylab("Converted") +
+  labs(color = "Observation Date") +
+  theme_light()
+```
+
+Finally, we see the R^2 value for the above data. (Recall R^2 ~ 1 implies a stronger fit, or better performing conversion)
+
+```{r}
+x = cor(x = lri_2_both_dat$dissolved_oxygen_percent_saturation_avg, 
+        y = lri_2_both_dat$dissolved_oxygen_percent_saturation_converted)
+x^2
+```
+
+
+
